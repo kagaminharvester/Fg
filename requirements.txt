@@ -1,0 +1,10 @@
+PyQt6>=6.5.0
+opencv-python>=4.7.0
+numpy>=1.21
+matplotlib>=3.7
+scipy>=1.10
+torch>=2.0; platform_system != 'Darwin'
+ultralytics>=8.0.0
+tensorrt; sys_platform == 'win32'
+onnxruntime-gpu; sys_platform == 'win32'
+buttplug-py; sys_platform == 'win32'
