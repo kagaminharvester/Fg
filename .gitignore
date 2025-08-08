@@ -1,2 +1,94 @@
-node_modules/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Virtual environments
 .env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Models and data
+models/*.pt
+models/*.engine
+models/*.onnx
+*.weights
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+temp/
+logs/
+
+# Performance test outputs
+benchmark_results/
+performance_logs/
+
+# Device connection files
+device_config.json
+connection_keys.txt
+
+# Qt cache
+*.qmlc
+*.jsc
+
+# Matplotlib cache
+.matplotlib/
+
+# Node.js (from original)
+node_modules/
+
+# TensorRT optimization files
+*.trt
+*.plan
+
+# CUDA cache
+.nv/
