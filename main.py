@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import threading
+import asyncio
 from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,10 @@ from tracker import SimpleTracker
 from funscript_generator import map_positions, Funscript
 from roi_selector import ROISelector
 from detector import ObjectDetector
+from enhanced_tracker import GPUAcceleratedTracker, TrackingMethod, MultiTracker
+from enhanced_detector import EnhancedObjectDetector, DetectionBackend
+from performance_optimizer import RTX3090Optimizer, setup_rtx3090_environment, validate_150fps_capability
+from live_streaming import LiveStreamer, DeviceType, DeviceSimulator
 
 
 @dataclass
@@ -78,12 +83,31 @@ class VideoProcessingThread(QThread):
         self.use_gpu = torch.cuda.is_available()
         self.device = torch.device('cuda' if self.use_gpu else 'cpu')
         
+        # Initialize optimizer
+        self.optimizer = setup_rtx3090_environment() if self.use_gpu else None
+        
     def setup(self, video_path: str, roi: Tuple[int, int, int, int], detector_path: str = None):
         """Setup video processing with GPU acceleration."""
-        self.video_loader = VideoLoader(video_path, target_width=1280, device=0 if self.use_gpu else None)
-        self.tracker = SimpleTracker()
+        device_id = 0 if self.use_gpu else None
+        self.video_loader = VideoLoader(video_path, target_width=1280, device=device_id)
+        
+        # Use enhanced tracker with GPU acceleration
+        self.tracker = GPUAcceleratedTracker(
+            method=TrackingMethod.TEMPLATE_MATCHING,
+            use_gpu=self.use_gpu,
+            device_id=0
+        )
+        
+        # Use enhanced detector if model path provided
         if detector_path:
-            self.detector = ObjectDetector(detector_path, device="cuda" if self.use_gpu else "cpu")
+            self.detector = EnhancedObjectDetector(
+                model_path=detector_path,
+                backend=DetectionBackend.PYTORCH,
+                device="cuda" if self.use_gpu else "cpu"
+            )
+            if self.use_gpu:
+                self.detector.optimize_for_rtx3090()
+        
         self.roi = roi
         
     def run(self):
@@ -100,7 +124,10 @@ class VideoProcessingThread(QThread):
             frame_idx, frame = next(it)
             if isinstance(frame, tuple):
                 frame = frame[0]  # Use left eye for stereo
-            self.tracker.init(frame, self.roi)
+            success = self.tracker.init(frame, self.roi)
+            if not success:
+                print("Failed to initialize tracker")
+                return
         except StopIteration:
             return
             
@@ -122,10 +149,11 @@ class VideoProcessingThread(QThread):
                     # Process on GPU (placeholder for actual GPU operations)
                     frame = frame_tensor.cpu().numpy()
                 
-                # Update tracking
-                roi = self.tracker.update(frame)
-                _, y1, _, y2 = roi
-                center_y = y1 + (y2 - y1) / 2
+                # Update tracking using enhanced tracker
+                result = self.tracker.update(frame)
+                roi = result.roi
+                center_y = result.center_y
+                confidence = result.confidence
                 
                 # Calculate performance metrics
                 frame_end = time.time()
@@ -146,7 +174,12 @@ class VideoProcessingThread(QThread):
                     metrics.gpu_usage = 85.0  # Placeholder
                 
                 # Emit signals
-                self.frameProcessed.emit(frame_idx, frame, {'roi': roi, 'center_y': center_y})
+                self.frameProcessed.emit(frame_idx, frame, {
+                    'roi': roi, 
+                    'center_y': center_y, 
+                    'confidence': confidence,
+                    'tracking_time': result.processing_time
+                })
                 self.metricsUpdated.emit(metrics)
                 self.positionUpdate.emit(center_y)
                 
@@ -363,6 +396,16 @@ class EnhancedMainWindow(QMainWindow):
         self.frame_height: Optional[int] = None
         self.fps: float = 30.0
         self.is_processing = False
+        
+        # Performance optimization
+        self.optimizer = setup_rtx3090_environment() if torch.cuda.is_available() else None
+        self.performance_validated = validate_150fps_capability()
+        
+        # Live streaming
+        self.live_streamer = LiveStreamer()
+        self.live_streamer.statusChanged.connect(self.on_streaming_status_changed)
+        self.live_streamer.metricsUpdated.connect(self.on_streaming_metrics_updated)
+        self.live_streamer.errorOccurred.connect(self.on_streaming_error)
         
         self.setup_dark_theme()
         self.setup_ui()
@@ -609,12 +652,13 @@ class EnhancedMainWindow(QMainWindow):
         
         live_form.addWidget(QLabel("Device:"), 0, 0)
         self.device_combo = QComboBox()
-        self.device_combo.addItems(["The Handy", "OSR2", "SR6", "Custom"])
+        self.device_combo.addItems(["The Handy", "OSR2", "SR6", "Buttplug.io", "Simulator"])
+        self.device_combo.currentTextChanged.connect(self.on_device_type_changed)
         live_form.addWidget(self.device_combo, 0, 1)
         
         live_form.addWidget(QLabel("Connection:"), 1, 0)
         self.connection_edit = QtWidgets.QLineEdit()
-        self.connection_edit.setPlaceholderText("Device key or connection string")
+        self.connection_edit.setPlaceholderText("Device key, port, or connection string")
         live_form.addWidget(self.connection_edit, 1, 1)
         
         self.connect_btn = QPushButton("🔗 Connect Device")
@@ -626,15 +670,41 @@ class EnhancedMainWindow(QMainWindow):
         self.stream_btn.setEnabled(False)
         live_form.addWidget(self.stream_btn, 3, 0, 1, 2)
         
+        # Streaming controls
+        live_form.addWidget(QLabel("Latency:"), 4, 0)
+        self.latency_slider = QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.latency_slider.setRange(10, 200)
+        self.latency_slider.setValue(50)
+        live_form.addWidget(self.latency_slider, 4, 1)
+        
+        live_form.addWidget(QLabel("Intensity:"), 5, 0)
+        self.intensity_slider = QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.intensity_slider.setRange(50, 150)
+        self.intensity_slider.setValue(100)
+        live_form.addWidget(self.intensity_slider, 5, 1)
+        
         live_layout.addWidget(live_group)
         
-        # Stream status
-        status_group = QGroupBox("Stream Status")
+        # Stream status and metrics
+        status_group = QGroupBox("Stream Status & Metrics")
         status_layout = QVBoxLayout(status_group)
+        
         self.status_text = QTextEdit()
-        self.status_text.setMaximumHeight(150)
+        self.status_text.setMaximumHeight(100)
         self.status_text.setReadOnly(True)
         status_layout.addWidget(self.status_text)
+        
+        # Streaming metrics
+        metrics_layout = QGridLayout()
+        self.latency_label = QLabel("Latency: 0ms")
+        self.commands_label = QLabel("Commands: 0")
+        self.quality_label = QLabel("Quality: 0%")
+        
+        metrics_layout.addWidget(self.latency_label, 0, 0)
+        metrics_layout.addWidget(self.commands_label, 0, 1)
+        metrics_layout.addWidget(self.quality_label, 1, 0)
+        
+        status_layout.addLayout(metrics_layout)
         live_layout.addWidget(status_group)
         
         live_layout.addStretch()
@@ -764,6 +834,114 @@ class EnhancedMainWindow(QMainWindow):
             timestamp = len(self.simulator.positions) * (1.0 / self.fps)
             self.simulator.add_position(norm_pos, timestamp)
             
+            # Stream to device if connected and streaming
+            if (self.live_streamer.status.value == "streaming" and 
+                self.intensity_slider.value() > 0):
+                # Apply intensity scaling
+                intensity = self.intensity_slider.value() / 100.0
+                scaled_pos = norm_pos * intensity
+                self.live_streamer.queue_command(int(scaled_pos))
+    
+    def on_device_type_changed(self, device_name: str):
+        """Handle device type change."""
+        device_map = {
+            "The Handy": DeviceType.THE_HANDY,
+            "OSR2": DeviceType.OSR2,
+            "SR6": DeviceType.SR6,
+            "Buttplug.io": DeviceType.BUTTPLUG,
+            "Simulator": DeviceType.CUSTOM
+        }
+        
+        device_type = device_map.get(device_name, DeviceType.THE_HANDY)
+        self.live_streamer.set_device_type(device_type)
+        
+        # Update connection placeholder
+        placeholders = {
+            "The Handy": "Enter API key",
+            "OSR2": "COM3 or /dev/ttyUSB0",
+            "SR6": "COM3 or /dev/ttyUSB0", 
+            "Buttplug.io": "ws://localhost:12345",
+            "Simulator": "simulator"
+        }
+        self.connection_edit.setPlaceholderText(placeholders.get(device_name, "Connection string"))
+    
+    def connect_device(self):
+        """Connect to live streaming device."""
+        connection = self.connection_edit.text().strip()
+        
+        if not connection:
+            QtWidgets.QMessageBox.information(self, "Info", "Enter device connection details.")
+            return
+            
+        # Handle simulator case
+        if self.device_combo.currentText() == "Simulator":
+            # Use device simulator
+            self.live_streamer.device_interface = DeviceSimulator()
+            
+        self.status_text.append(f"🔗 Connecting to {self.device_combo.currentText()}...")
+        self.connect_btn.setEnabled(False)
+        
+        # Connect asynchronously
+        import asyncio
+        
+        async def connect_async():
+            try:
+                success = await self.live_streamer.connect_device(connection)
+                return success
+            except Exception as e:
+                self.status_text.append(f"❌ Connection failed: {str(e)}")
+                return False
+        
+        # Run in thread to avoid blocking UI
+        def connect_thread():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                success = loop.run_until_complete(connect_async())
+                if success:
+                    self.status_text.append("✅ Device connected successfully")
+                    self.stream_btn.setEnabled(True)
+                    self.connect_btn.setText("🔌 Connected")
+                else:
+                    self.status_text.append("❌ Failed to connect to device")
+                    self.connect_btn.setEnabled(True)
+            finally:
+                loop.close()
+                
+        threading.Thread(target=connect_thread, daemon=True).start()
+        
+    def toggle_live_stream(self):
+        """Toggle live streaming to device."""
+        if self.stream_btn.text().startswith("📡 Start"):
+            self.live_streamer.start_streaming()
+            self.stream_btn.setText("⏹ Stop Stream")
+            self.status_text.append("📡 Live streaming started")
+        else:
+            self.live_streamer.stop_streaming()
+            self.stream_btn.setText("📡 Start Live Stream")
+            self.status_text.append("⏹ Live streaming stopped")
+    
+    def on_streaming_status_changed(self, status: str):
+        """Handle streaming status changes."""
+        self.status_text.append(f"Status: {status}")
+        
+        if status == "connected":
+            self.stream_btn.setEnabled(True)
+        elif status == "disconnected":
+            self.stream_btn.setEnabled(False)
+            self.connect_btn.setText("🔗 Connect Device")
+            self.connect_btn.setEnabled(True)
+    
+    def on_streaming_metrics_updated(self, metrics: dict):
+        """Handle streaming metrics updates."""
+        self.latency_label.setText(f"Latency: {metrics.get('latency_ms', 0):.1f}ms")
+        self.commands_label.setText(f"Commands: {metrics.get('commands_sent', 0)}")
+        self.quality_label.setText(f"Quality: {metrics.get('connection_quality', 0)*100:.1f}%")
+    
+    def on_streaming_error(self, error: str):
+        """Handle streaming errors."""
+        self.status_text.append(f"❌ Error: {error}")
+            
     def toggle_playback(self):
         """Toggle video playback."""
         if self.is_processing:
@@ -818,30 +996,7 @@ class EnhancedMainWindow(QMainWindow):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select video folder")
         if folder:
             self.status_text.append(f"📦 Batch processing: {folder}")
-            # Implementation for batch processing
-            
-    def connect_device(self):
-        """Connect to live streaming device."""
-        device = self.device_combo.currentText()
-        connection = self.connection_edit.text()
-        
-        if not connection:
-            QtWidgets.QMessageBox.information(self, "Info", "Enter device connection details.")
-            return
-            
-        # Placeholder for device connection
-        self.status_text.append(f"🔗 Connecting to {device}...")
-        self.stream_btn.setEnabled(True)
-        self.connect_btn.setText("🔌 Connected")
-        
-    def toggle_live_stream(self):
-        """Toggle live streaming to device."""
-        if self.stream_btn.text().startswith("📡 Start"):
-            self.stream_btn.setText("⏹ Stop Stream")
-            self.status_text.append("📡 Live streaming started")
-        else:
-            self.stream_btn.setText("📡 Start Live Stream")
-            self.status_text.append("⏹ Live streaming stopped")
+            # Implementation for batch processing with enhanced features
 
 
 def main():
