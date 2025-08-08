@@ -17,7 +17,7 @@ import time
 class GPUTracker:
     """GPU-accelerated object tracker using CUDA."""
     
-    def __init__(self, method: str = "CSRT", use_gpu: bool = True):
+    def __init__(self, method: str = "TEMPLATE", use_gpu: bool = True):
         self.method = method
         self.use_gpu = use_gpu and self._check_cuda_support()
         self.tracker = None
@@ -70,14 +70,46 @@ class GPUTracker:
                 self.use_gpu = False
                 
         # Initialize OpenCV tracker as fallback
-        if self.method == "CSRT":
-            self.tracker = cv2.TrackerCSRT_create()
+        if self.method == "TEMPLATE":
+            # Use template matching only
+            self.tracker = None
+        elif self.method == "CSRT":
+            try:
+                self.tracker = cv2.TrackerCSRT_create()
+            except AttributeError:
+                try:
+                    self.tracker = cv2.legacy.TrackerCSRT_create()
+                except AttributeError:
+                    print("CSRT tracker not available, falling back to template matching")
+                    self.tracker = None
         elif self.method == "KCF":
-            self.tracker = cv2.TrackerKCF_create()
+            try:
+                self.tracker = cv2.TrackerKCF_create()
+            except AttributeError:
+                try:
+                    self.tracker = cv2.legacy.TrackerKCF_create()
+                except AttributeError:
+                    print("KCF tracker not available, falling back to template matching")
+                    self.tracker = None
         elif self.method == "MOSSE":
-            self.tracker = cv2.legacy.TrackerMOSSE_create()
+            try:
+                self.tracker = cv2.TrackerMOSSE_create()
+            except AttributeError:
+                try:
+                    self.tracker = cv2.legacy.TrackerMOSSE_create()
+                except AttributeError:
+                    print("MOSSE tracker not available, falling back to template matching")
+                    self.tracker = None
         else:
-            self.tracker = cv2.TrackerCSRT_create()
+            # Try CSRT first, then fallback
+            try:
+                self.tracker = cv2.TrackerCSRT_create()
+            except AttributeError:
+                try:
+                    self.tracker = cv2.legacy.TrackerCSRT_create()
+                except AttributeError:
+                    print("No OpenCV trackers available, using template matching")
+                    self.tracker = None
             
         if self.tracker:
             self.tracker.init(frame, (x1, y1, x2 - x1, y2 - y1))
